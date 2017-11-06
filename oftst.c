@@ -1,3 +1,91 @@
+/*
+ * 'Glue' driver to use FPGA-manager without device-tree overlays etc.
+ *
+ * This driver can be used in two ways:
+ *
+ *   1. together with device-tree definition
+ *   2. w/o device-tree modification
+ *
+ * 1. Device-tree
+ *
+ * In the first use case a device-tree entry must be created (at the top-level, i.e.,
+ * the 'platform bus' level):
+ *
+ *  prog_fpga0: prog-fpga0 {
+ *      compatible = "tills,fpga-programmer-1.0";
+ *      fpga-mgr   = <&devcfg>;     # reference must point to the fpga controller (e.g., zynq devcfg)
+ *      file       = "zzz.bin";     # optional firmware file name (must be present in one of the directories
+ *                                  # automatically searched by the kernel or in a path as given in
+ *                                  # /sys/module/firmware_class/parameters/path
+ *      autoload   = 1;             # when autoload is nonzero then firmware is loaded when the driver
+ *                                  # is bound or whenever the 'file' property is written in sysfs
+ *                                  # (see below). If autoload is '0' then you must explicitly write
+ *                                  # to the 'program' property in sysfs (see below).
+ *  };
+ *
+ *
+ * When the driver is bound then it will add a few sysfs properties to the device
+ *
+ *   /sys/bus/platform/devices/prog-fpga0/
+ *
+ *    file:     name of firmware file; if 'autoload' is nonzero then writing a filename
+ *              to 'file' triggers programming.
+ *
+ *    autoload: whether binding the driver or writing 'file' triggers programming
+ *
+ *    program:  writing nonzero here triggers programming (required if autoload is zero)
+ *
+ * The device-tree use-case allows to automatically load a default firmware file during
+ * boot-up.
+ *
+ * 2. No device-tree
+ *
+ * This driver can also be used without a modified device tree. In this case, the user must
+ * instruct the driver to create 'soft' devices which replace the auto-generated ones that
+ * the kernel builds when processing the device tree.
+ *
+ * You can simply create a soft device by writing the device-tree path to the controller
+ * to the driver's 'add_programmer' property.
+ * 
+ * Note that the controller itself still must be defined in the device tree. E.g., for
+ * zynq we have (on amba bus):
+ *
+ *    amba: amba {
+ * 
+ *      ...
+ *
+ *      devcfg: devcfg@f8007000 {
+ *          compatible = "xlnx,zynq-devcfg-1.0";
+ *          reg = <0xf8007000 0x100>;
+ *          interrupt-parent = <&intc>;
+ *          interrupts = <0 8 4>;
+ *          clocks = <&clkc 12>;
+ *          clock-names = "ref_clk";
+ *          syscon = <&slcr>;
+ *      };
+ *   };
+ *  
+ * Thus the device-tree path to the controller is '/amba/devcfg@f8007000' and
+ *
+ *   echo -n '/amba/devcfg@f8007000' > /sys/bus/platform/driver/fpga_programmer/add_programmer
+ *
+ * generates a new device (note that the naming is slightly different than in use case 1.)
+ *
+ *   /sys/bus/platform/devices/prog-fpga.0/
+ *
+ * which is bound to the driver and features the same 'file', 'autoload' etc. properties.
+ *
+ * Soft devices can be removed (write nonzero to 'remove').
+ *
+ * PROGRAMMING (identical for use case 1. and 2.):
+ *
+ *  E.g.:
+ *
+ *      echo -n '/' > /sys/module/firmware_class/parameters/path
+ *
+ *      echo -n '/mnt/somewhere/something.bin' > /sys/bus/platform/devices/prog-fpga.0/file
+ * 
+ */
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/device.h>
@@ -7,14 +95,12 @@
 
 MODULE_LICENSE("Dual BSD/GPL");
 
+
+/* Forward Declarations
+ */
 struct fpga_prog_drvdat;
+
 static struct platform_driver fpga_prog_driver;
-
-#define OF_COMPAT "tills,fpga-programmer-1.0"
-
-static const char *drvnam = "prog-fpga";
-
-static DEFINE_IDA(fpga_prog_ida);
 
 static ssize_t
 add_prog_store(struct device_driver *drv, const char *buf, size_t sz);
@@ -46,9 +132,19 @@ get_drvdat(struct device *dev);
 static void
 release_drvdat(struct fpga_prog_drvdat *prg);
 
-static void release_dev(struct device *dev);
+static void
+release_pdev(struct device *dev);
 
-static int load_fw(struct fpga_prog_drvdat *prg);
+static int
+load_fw(struct fpga_prog_drvdat *prg);
+
+
+#define OF_COMPAT "tillst,fpga-programmer-1.0"
+
+static const char *drvnam = "prog-fpga";
+
+static DEFINE_IDA(fpga_prog_ida);
+
 
 DRIVER_ATTR( add_programmer, S_IWUSR | S_IWGRP, 0, add_prog_store );
 
@@ -65,22 +161,53 @@ static struct device_attribute *dev_attrs[] = {
 
 #define N_DEV_ATTRS (sizeof(dev_attrs)/sizeof(dev_attrs[0]))
 
-#define MAXLEN 1023
-
+/* 'Soft' programmer device - used if we don't have a device-tree entry
+ */
 struct fpga_prog_dev {
 	struct platform_device pdev;
+    /* Keep a reference to the fpga_manager's of_node;
+	 * we hold it for the lifetime of this device
+	 */
 	struct device_node    *mgrNode;
 };
 
+/* Programmer data
+ */
 struct fpga_prog_drvdat {
 	struct platform_device *pdev;
+    /* Keep a reference to the fpga_manager's of_node;
+	 * we hold while the driver is attached/bound
+	 */
 	struct device_node     *mgrNode;
+	/* Firmware file name
+	 */
 	const char             *file;
 	int                    autoload;
+	/* Info data for the manager
+	 */
 	struct fpga_image_info info;
 };
 
-static struct fpga_manager *of_get_mgr_from_pdev(struct platform_device *pdev, struct device_node **mgrNode)
+/* Retrieve the fpga_manager associated with a platform device.
+ *
+ * RETURNS: - the manager (exclusive ref; must be released after use)
+ *          - a reference to the manager's of node (in *mgrNode)
+ *
+ * If this routine fails then no reference (neither to the manager nor of-node)
+ * is held. On error, a status is encoded in the pointer return value.
+ *
+ * There are two cases (correponding to the two use cases described above):
+ *
+ *  1. the pdev has a of_node -> there is a devtree node and its 'fpga-mgr'
+ *     property must point to the fpga controller. We use that to obtain
+ *     the reference to the manager.
+ *  2. the pdev has no of_node -> it is a 'soft' created device by this driver.
+ *     The device has a reference to the manager's of_node which we use to
+ *     obtain the manager itself.
+ */
+
+static struct fpga_manager*
+of_get_mgr_from_pdev(struct platform_device *pdev, struct device_node **mgrNode)
 {
 struct device_node   *pnod = pdev->dev.of_node;
 struct device_node   *mnod = 0;
@@ -89,14 +216,14 @@ struct fpga_prog_dev *prgd;
 
 	if ( ! pnod ) {
 		/* this is a fpga_prog_dev (run-time created; no OF) */
-printk( KERN_ERR " initial pnod NULL; trying parent \n");
 		prgd = container_of( pdev, struct fpga_prog_dev, pdev );
 		mnod = prgd->mgrNode;
+		/* increment ref-count */
 		of_node_get( mnod );
 	} else {
+		/*  we have an of_node; retrieve 'fpga-mgr'... */
 		of_node_get( pnod );
 			if ( of_device_is_compatible(pnod, OF_COMPAT) ) {
-	printk( KERN_ERR " still pnod NULL; trying parent \n");
 				mnod = of_parse_phandle(pnod, "fpga-mgr", 0);
 			}
 		of_node_put( pnod );
@@ -111,60 +238,89 @@ printk( KERN_ERR " initial pnod NULL; trying parent \n");
 		printk( KERN_ERR "%s: invalid or missing 'fpga-mgr' property\n", drvnam);
 		mgr = ERR_PTR( -EINVAL );
 	}
+	/* at this point we have either a valid manager + its OF node
+	 * (also with incremented ref-count) or mknod == NULL and an error
+	 * code in 'mgr'.
+	 */
 	*mgrNode = mnod;
 	return mgr;
 }
 
 
-/* Return a manager; reference to mgr->of_node is incremented on success (only) */
-static struct fpga_manager *of_get_mgr_from_path(const char *path, struct device_node **mgrNode)
+/* Retrieve an fpga_manager from its OF path (this is the device-tree path; not 
+ * the sysfs path!)
+ *
+ * RETURNS: - the manager (exclusive ref; must be released after use)
+ *          - a reference to the manager's of node (in *mgrNode)
+ *
+ * If this routine fails then no reference (neither to the manager nor of-node)
+ * is held. On error, a status is encoded in the pointer return value.
+ *
+ */
+
+static struct fpga_manager *
+of_get_mgr_from_path(const char *path, struct device_node **mgrNode)
 {
 struct device_node  *mnod = of_find_node_by_path( path );
-struct fpga_manager *mgr  = 0;
+struct fpga_manager *mgr  = ERR_PTR( -ENOENT );
 
-	if ( ! mnod )
-		return ERR_PTR( -ENOENT );
+	if ( mnod ) {
 
-	mgr = of_fpga_mgr_get( mnod );
+		mgr = of_fpga_mgr_get( mnod );
 
-	if ( IS_ERR( mgr ) ) {
-		of_node_put( mnod );
-	} else {
-		*mgrNode = mnod;
+		if ( IS_ERR( mgr ) ) {
+			of_node_put( mnod );
+			mnod = 0;
+		}
 	}
 
+	*mgrNode = mnod;
 	return mgr;
 }
 
-static int cmp_mgr_node(struct device *dev, void *data)
+/* Helper to locate a matching device which
+ * is already using the fpga_manager with of-node 'data'
+ */
+static int
+cmp_mgr_node(struct device *dev, void *data)
 {
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 
 	return (void *)prg->mgrNode == data;
 }
 
-static int cmp_release_func(struct device *dev, void *data)
+/* Helper to locate a matching soft device which
+ * is already using the fpga_manager with of-node 'data'.
+ *
+ * Since it may be used on other devices we must ensure
+ * that the device we use for comparison is indeed
+ * one of ours - we do this by checking it's 'release'
+ * member.
+ */
+static int
+cmp_release_func(struct device *dev, void *data)
 {
-	return dev->release == release_dev && cmp_mgr_node( dev, data );
+struct fpga_prog_dev *prgd;
+	if ( dev->release != release_pdev )
+		return 0;
+
+	prgd = container_of( dev, struct fpga_prog_dev, pdev.dev );
+
+	return (void*)prgd->mgrNode == data;
 }
 
-static int load_fw(struct fpga_prog_drvdat *prg)
+/* Load firmware using the fpga_manager
+ */
+static int
+load_fw(struct fpga_prog_drvdat *prg)
 {
 struct fpga_manager   *mgr;
 int                    err;
-struct device_node    *pnod;
 
 	if ( ! prg->file )
 		return -EINVAL;
 
-	/* Platform devices created by this driver don't have an OF-node but
-	 * their parent does point to the correct one...
-	 */
-	pnod = prg->pdev->dev.of_node;
-	if ( ! pnod && prg->pdev->dev.parent )
-		pnod = prg->pdev->dev.parent->of_node;
-
-	mgr = of_fpga_mgr_get( pnod );
+	mgr = of_fpga_mgr_get( prg->mgrNode );
 
 	if ( IS_ERR( mgr ) ) {
 		err = PTR_ERR( mgr );
@@ -176,18 +332,41 @@ struct device_node    *pnod;
 	return err;
 }
 
-
-static void release_dev(struct device *dev)
+/* Release private data associated with our
+ * 'soft' device (fpga_prog_dev)
+ */
+static void
+release_pdev(struct device *dev)
 {
 struct fpga_prog_dev *pdev = container_of( dev, struct fpga_prog_dev, pdev.dev );
-	printk(KERN_DEBUG "DEV_REL\n");
+
 	of_node_put( pdev->mgrNode );
 	ida_simple_remove( &fpga_prog_ida, dev->id );
 	kfree( dev );
+
+	/* We hold on to this module for as long as any soft device exists
+	 */
 	module_put( THIS_MODULE );
 }
 
-static struct fpga_prog_dev *create_pdev(struct fpga_manager *mgr, struct device_node *mgrNode)
+/* Create a soft programmer device (use case 2.)
+ *
+ * On call: 'mgr'     -> fpga_manager with exclusive reference held
+ *          'mgrNode' -> manager's of-node with refcnt incremented
+ *
+ * RETURN:
+ *   On success (0): - the platform device was successfully added to the
+ *                     system and is managed by it now.
+ *                   - the reference count of 'THIS_MODULE' is incremented
+ *   On failure    : - negative error status is returned
+ *
+ *   In any case (error or success):
+ *                   - the fpga_manager is released (put)
+ *                   - the reference count of 'mgrNode' is 'taken over'
+ *                     (ref either held by device or dropped).
+ */
+static int
+create_pdev(struct fpga_manager *mgr, struct device_node *mgrNode)
 {
 struct fpga_prog_dev   *prgd = 0;
 struct fpga_prog_dev   *mem  = 0;
@@ -196,7 +375,7 @@ int                     stat;
 int                     mgrPut = 0;
 
 	if ( ! ( prgd = kzalloc( sizeof(*prgd), GFP_KERNEL ) ) ) {
-		prgd = ERR_PTR( -ENOMEM );
+		stat = -ENOMEM;
 		goto bail;
 	}
 
@@ -206,44 +385,49 @@ int                     mgrPut = 0;
 
 	id = ida_simple_get( &fpga_prog_ida, 0, 0, GFP_KERNEL );
 	if ( id < 0 ) {
-		prgd = ERR_PTR( id );
+		stat = id;
 		goto bail;
 	}
 
 	prgd->pdev.id           = mgr->dev.id;
-
-	prgd->pdev.dev.parent   = mgr->dev.parent;
 	prgd->pdev.dev.id       = id;
-	prgd->pdev.dev.release  = release_dev;
+	prgd->pdev.dev.release  = release_pdev;
 
 	prgd->mgrNode           = mgrNode;
-	mgrNode                 = 0;
 
+	/* must 'put' the manager before registering the device
+	 * because this may trigger the driver to be bound which
+	 * then will need the manager. Avoid deadlock by releasing
+	 * here. (The manager can only be held exclusivly.)
+	 */
 	fpga_mgr_put( mgr );
 	mgrPut = 1;
 
+	/* If the device can be successfully registered then
+	 * we must not remove this module while it is in use.
+	 */
+	__module_get( THIS_MODULE );
 
 	stat = platform_device_register( &prgd->pdev );
 	if ( stat ) {
-		prgd = ERR_PTR( stat );
+		module_put( THIS_MODULE );
 		goto bail;
 	}
 
 	/* After this point 'platform_device_unregister()' should take care
-	 * of the memory and id
+	 * of the module, mgrNode, id and memory.
 	 */
 
-	mem =  0;
-	id  = -1;
+	mgrNode = 0;
+	mem     =  0;
+	id      = -1;
 
+	/* Add a property that allows for the user to hot-unplug this device
+	 */
 	if ( (stat = device_create_file( &prgd->pdev.dev, &dev_attr_remove )) ) {
 		platform_device_unregister( &prgd->pdev );
-		prgd = ERR_PTR( stat );
 		goto bail;
 	}
-
-	__module_get( THIS_MODULE );
-
 
 bail:
 	if ( ! mgrPut ) {
@@ -259,15 +443,19 @@ bail:
 	}
 
 	if ( mem ) {
-		of_node_put( mem->mgrNode );
 		kfree( mem );
-		module_put( THIS_MODULE );
 	}
 
-	return prgd;
+	return stat;
 }
 
-static struct fpga_prog_drvdat *create_drvdat( struct platform_device *pdev, struct device_node *mgrNode )
+
+/* Create and initialize driver-private data. The ref. to the 'mgrNode' is
+ * either consumed by this routine (success) or must be dropped by the caller
+ * (failure).
+ */
+static struct fpga_prog_drvdat *
+create_drvdat( struct platform_device *pdev, struct device_node *mgrNode )
 {
 struct fpga_prog_drvdat *prog;
 struct device           *dev;
@@ -318,7 +506,14 @@ u32                      val;
 	return prog;
 }
 
-static int dev_attach(struct platform_device *pdev, struct fpga_manager *mgr, struct device_node *mgrNode)
+/* Attach to a programmer device (either soft or 'hard', i.e., from device-tree)
+ *
+ * Call: with refs. to fpga_manager and it's of-node. The 'mgrNode' reference is
+ * 'consumed' by this routine, i.e., either stored in the driver-private data or
+ * dropped. The ref. to the manager is unchanged.
+ */
+static int
+dev_attach(struct platform_device *pdev, struct fpga_manager *mgr, struct device_node *mgrNode)
 {
 struct fpga_prog_drvdat *drvdat;
 struct fpga_prog_drvdat *mem  = 0;
@@ -343,9 +538,9 @@ struct kobject          *mgrObj = 0;
 
 	/* for any error after here the mgrNode is 'put' by release_drvdat */
 
-	drvdat->pdev = pdev;
 	platform_set_drvdata( pdev, drvdat );
 
+	/* Add sysfs entries to device ('file', 'autoload' etc.) */
 	for ( i=0; i<N_DEV_ATTRS; i++ ) {
 		if ( (dev_attr_stat[i] = device_create_file( &pdev->dev, dev_attrs[i] )) )
 			break;
@@ -355,6 +550,7 @@ struct kobject          *mgrObj = 0;
 		goto bail;
 	}
 
+	/* Add symlink to fpga_manager */
 	mgrObj = & mgr->dev.kobj;	
 
 	kobject_get( mgrObj );
@@ -381,15 +577,17 @@ bail:
 	return stat;
 }
 
-static int fpga_prog_probe(struct platform_device *pdev)
+/* Driver probe function
+ */
+static int
+fpga_prog_probe(struct platform_device *pdev)
 {
 struct fpga_manager     *mgr;
 struct device_node      *mgrNode;
 int                      stat, fwstat;
 struct fpga_prog_drvdat *prg;
 
-	printk("PROG_PROBE\n");
-
+	/* Locate an fpga_manager for this device */
 	mgr = of_get_mgr_from_pdev( pdev, &mgrNode );
 	if ( IS_ERR( mgr ) ) {
 		printk(KERN_ERR "%s: no fpga-manager found (%ld)\n", drvnam, PTR_ERR(mgr));
@@ -402,6 +600,10 @@ struct fpga_prog_drvdat *prg;
 	stat = dev_attach( pdev, mgr, mgrNode );
 
 	if ( 0 == stat ) {
+		/* If - after successfully attaching to the device we
+		 * have enough information then we can attempt to load
+		 * firmware.
+		 */
 		prg = platform_get_drvdata( pdev );
 		if ( prg->file && prg->autoload ) {
 			fwstat = fpga_mgr_firmware_load( mgr, &prg->info , prg->file );
@@ -411,12 +613,16 @@ struct fpga_prog_drvdat *prg;
 		}
 	}
 
+	/* Release manager */
 	fpga_mgr_put( mgr );
 
 	return stat;
 }
 
-static void release_drvdat(struct fpga_prog_drvdat *prg)
+/* Cleanup driver private data
+ */
+static void
+release_drvdat(struct fpga_prog_drvdat *prg)
 {
 	if ( prg->mgrNode ) {
 		of_node_put( prg->mgrNode );
@@ -429,12 +635,13 @@ static void release_drvdat(struct fpga_prog_drvdat *prg)
 	kfree( prg );
 }
 
-static int fpga_prog_remove(struct platform_device *pdev)
+/* Driver remove function
+ */
+static int
+fpga_prog_remove(struct platform_device *pdev)
 {
 struct fpga_prog_drvdat *prg = platform_get_drvdata( pdev );
 int                      i;
-
-	printk("PROG_RELEASE\n");
 
 	for ( i=0; i < N_DEV_ATTRS; i++ ) {
 		device_remove_file( &pdev->dev, dev_attrs[i] );
@@ -447,11 +654,13 @@ int                      i;
 	return 0;
 }
 
+/* Add a 'soft' device (support 'remove' device attribute in sysfs)
+ */
 static ssize_t
 add_prog_store(struct device_driver *drv, const char *buf, size_t sz)
 {
 struct fpga_manager     *mgr;
-struct fpga_prog_dev    *pdev;
+int                      stat;
 struct device           *dev;
 struct device_node      *mgrNode = 0;
 
@@ -459,7 +668,7 @@ struct device_node      *mgrNode = 0;
 		return -EINVAL;
 
 
-	if ( sz > MAXLEN ) {
+	if ( sz > PAGE_SIZE - 1 ) {
 		return -ENOMEM;
 	}
 
@@ -468,28 +677,28 @@ struct device_node      *mgrNode = 0;
 	if ( IS_ERR( mgr ) ) {
 		return PTR_ERR( mgr );
 	}
+	/* Hold refs to manager and mgrNode here */
 
-	/** FIXME **/
 	if ( (dev = device_find_child( &platform_bus, mgrNode , cmp_release_func )) ) {
-		put_device( dev );
-		fpga_mgr_put( mgr );
-		pdev = ERR_PTR(-EEXIST);
+		put_device  ( dev     );
+		fpga_mgr_put( mgr     );
+		of_node_put ( mgrNode );
+		stat = -EEXIST;
 	} else {
-		/* create_pdev releases the manager and keeps a ref. to the mgrNode
-		 * this ref. either lives on inside the pdev or must be released here
-		 * if create_pdev fails.
+		/* create_pdev takes over the manager and mgrNode references
 		 */
-		pdev = create_pdev( mgr, mgrNode );
+		stat = create_pdev( mgr, mgrNode );
 	}
 
-	if ( IS_ERR( pdev ) ) {
-		sz = PTR_ERR( pdev );
-		of_node_put( mgrNode );
+	if ( stat ) {
+		sz = stat;
 	}
 
 	return sz;
 }
 
+/* Remove a 'soft' device (support 'remove' device attribute in sysfs)
+ */
 static ssize_t
 remove_store(struct device *dev, struct device_attribute *att, const char *buf, size_t sz)
 {
@@ -506,12 +715,17 @@ int val;
 	return sz;
 }
 
-static struct fpga_prog_drvdat *get_drvdat(struct device *dev)
+/* Helper to find driver-private data
+ */
+static struct fpga_prog_drvdat *
+get_drvdat(struct device *dev)
 {
 struct platform_device *pdev = container_of( dev, struct platform_device, dev );
 	return (struct fpga_prog_drvdat*) platform_get_drvdata( pdev );
 }
 
+/* Sysfs attribute 'file' (store)
+ */
 static ssize_t
 file_store(struct device *dev, struct device_attribute *att, const char *buf, size_t sz)
 {
@@ -533,6 +747,8 @@ int    err;
 	return sz;
 }
 
+/* Sysfs attribute 'file' (show)
+ */
 static ssize_t
 file_show(struct device *dev, struct device_attribute *att, char *buf)
 {
@@ -550,6 +766,8 @@ int                   len;
 	return len;
 }
 
+/* Sysfs attribute 'program' (store)
+ */
 static ssize_t
 program_store(struct device *dev, struct device_attribute *att, const char *buf, size_t sz)
 {
@@ -569,6 +787,8 @@ int                   err;
 	return sz;
 }
 
+/* Sysfs attribute 'autoload' (show)
+ */
 static ssize_t
 autoload_show(struct device *dev, struct device_attribute *att, char *buf)
 {
@@ -578,6 +798,8 @@ struct fpga_prog_drvdat *prg = get_drvdat( dev );
 	return snprintf(buf, PAGE_SIZE, "%d\n", prg->autoload);
 }
 
+/* Sysfs attribute 'autoload' (store)
+ */
 static ssize_t
 autoload_store(struct device *dev, struct device_attribute *att, const char *buf, size_t sz)
 {
@@ -590,6 +812,8 @@ struct fpga_prog_drvdat *prg = get_drvdat( dev );
 	return sz;
 }
 
+/* Boilerplate
+ */
 #ifdef CONFIG_OF
 static const struct of_device_id fpga_prog_of_match[] = {
 	{ .compatible = OF_COMPAT, },
@@ -616,7 +840,7 @@ static struct platform_driver fpga_prog_driver = {
 };
 
 static int __init
-oftst_init(void)
+fpga_prog_init(void)
 {
 int                    err     = 0;
 
@@ -632,10 +856,10 @@ int                    err     = 0;
 }
 
 static void
-oftst_exit(void)
+fpga_prog_exit(void)
 {
 	platform_driver_unregister( &fpga_prog_driver );
 }
 
-module_init( oftst_init );
-module_exit( oftst_exit );
+module_init( fpga_prog_init );
+module_exit( fpga_prog_exit );
