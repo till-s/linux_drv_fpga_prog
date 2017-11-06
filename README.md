@@ -34,11 +34,11 @@
       fpga-mgr   = <&devcfg>;     # reference must point to the fpga controller (e.g., zynq devcfg)
       file       = "zzz.bin";     # optional firmware file name (must be present in one of the directories
                                   # automatically searched by the kernel or in a path as given in
-                                  # /sys/module/firmware_class/parameters/path
+                                  # /sys/module/firmware_class/parameters/path)
       autoload   = 1;             # when autoload is nonzero then firmware is loaded when the driver
-                                  # is bound or whenever the 'file' property is written in sysfs
-                                  # (see below). If autoload is '0' then you must explicitly write
-                                  # to the 'program' property in sysfs (see below).
+                                  # is bound or whenever the `file' property is written in sysfs
+                                  # (see below). If autoload is `0' then you must explicitly write
+                                  # to the `program' property in sysfs (see below).
     };
 
 
@@ -46,10 +46,10 @@
 
     /sys/bus/platform/devices/prog-fpga0/
 
-    file:     name of firmware file; if 'autoload' is nonzero then writing a filename
-              to 'file' triggers programming.
+    file:     name of firmware file; if `autoload' is nonzero then writing a filename
+              to `file' triggers programming.
 
-    autoload: whether binding the driver or writing 'file' triggers programming
+    autoload: whether binding the driver or writing `file' triggers programming
 
     program:  writing nonzero here triggers programming (required if autoload is zero)
 
@@ -63,7 +63,7 @@
  the kernel builds when processing the device tree.
 
  You can simply create a soft device by writing the device-tree path to the controller
- to the driver's 'add_programmer' property.
+ to the driver's `add_programmer' property.
  
  Note that the controller itself still must be defined in the device tree. E.g., for
  zynq we have (on amba bus):
@@ -83,7 +83,7 @@
       };
     };
   
- Thus the device-tree path to the controller is '/amba/devcfg@f8007000' and
+ Thus the device-tree path to the controller is `/amba/devcfg@f8007000' and
 
     echo -n '/amba/devcfg@f8007000' > /sys/bus/platform/driver/fpga_programmer/add_programmer
 
@@ -91,9 +91,9 @@
 
     /sys/bus/platform/devices/prog-fpga.0/
 
- which is bound to the driver and features the same 'file', 'autoload' etc. properties.
+ which is bound to the driver and features the same `file', `autoload' etc. properties.
 
- Soft devices can be removed (write nonzero to 'remove').
+ Soft devices can be removed (write nonzero to `remove').
 
 ## PROGRAMMING (identical for use case 1. and 2.):
 
