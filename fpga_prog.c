@@ -151,7 +151,7 @@ static int
 load_fw(struct fpga_prog_drvdat *prg);
 
 
-#define OF_COMPAT "tillst,fpga-programmer-1.0"
+#define OF_COMPAT "tills,fpga-programmer-1.0"
 
 static const char *drvnam = "prog-fpga";
 
