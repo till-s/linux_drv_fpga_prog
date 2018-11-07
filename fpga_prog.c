@@ -115,7 +115,7 @@ struct fpga_prog_drvdat;
 static struct platform_driver fpga_prog_driver;
 
 static ssize_t
-add_prog_store(struct device_driver *drv, const char *buf, size_t sz);
+add_programmer_store(struct device_driver *drv, const char *buf, size_t sz);
 
 static ssize_t
 remove_store(struct device *dev, struct device_attribute *att, const char *buf, size_t sz);
@@ -158,7 +158,7 @@ static const char *drvnam = "prog-fpga";
 static DEFINE_IDA(fpga_prog_ida);
 
 
-DRIVER_ATTR( add_programmer, S_IWUSR | S_IWGRP, 0, add_prog_store );
+DRIVER_ATTR_WO( add_programmer );
 
 DEVICE_ATTR_WO( remove   );
 DEVICE_ATTR_RW( file     );
@@ -191,9 +191,6 @@ struct fpga_prog_drvdat {
 	 * we hold while the driver is attached/bound
 	 */
 	struct device_node     *mgrNode;
-	/* Firmware file name
-	 */
-	const char             *file;
 	int                    autoload;
 	/* Info data for the manager
 	 */
@@ -329,7 +326,7 @@ load_fw(struct fpga_prog_drvdat *prg)
 struct fpga_manager   *mgr;
 int                    err;
 
-	if ( ! prg->file )
+	if ( ! prg->info.firmware_name )
 		return -EINVAL;
 
 	mgr = of_fpga_mgr_get( prg->mgrNode );
@@ -337,7 +334,7 @@ int                    err;
 	if ( IS_ERR( mgr ) ) {
 		err = PTR_ERR( mgr );
 	} else {
-		err = fpga_mgr_firmware_load( mgr, &prg->info , prg->file );
+		err = fpga_mgr_load( mgr, &prg->info );
 		fpga_mgr_put( mgr );
 	}
 
@@ -500,7 +497,7 @@ u32                      val;
 
 		stat = of_property_read_string( pnod, "file", &str );
 		if ( 0 == stat ) {
-			prog->file = kstrdup( str, GFP_KERNEL );
+			prog->info.firmware_name = kstrdup( str, GFP_KERNEL );
 		} else if ( stat != -EINVAL ) {
 			printk(KERN_WARNING "%s: unable to read 'file' property from OF (%d)\n", drvnam, stat);
 		}
@@ -617,8 +614,8 @@ struct fpga_prog_drvdat *prg;
 		 * firmware.
 		 */
 		prg = platform_get_drvdata( pdev );
-		if ( prg->file && prg->autoload ) {
-			fwstat = fpga_mgr_firmware_load( mgr, &prg->info , prg->file );
+		if ( prg->info.firmware_name && prg->autoload ) {
+			fwstat = fpga_mgr_load( mgr, &prg->info );
 			if ( fwstat ) {
 				printk(KERN_WARNING "%s: programming firmware failed (%d)\n", drvnam, fwstat);
 			}
@@ -640,8 +637,8 @@ release_drvdat(struct fpga_prog_drvdat *prg)
 		of_node_put( prg->mgrNode );
 	}
 
-	if ( prg->file ) {
-		kfree( prg->file );
+	if ( prg->info.firmware_name ) {
+		kfree( prg->info.firmware_name );
 	}
 
 	kfree( prg );
@@ -669,7 +666,7 @@ int                      i;
 /* Add a 'soft' device (support 'remove' device attribute in sysfs)
  */
 static ssize_t
-add_prog_store(struct device_driver *drv, const char *buf, size_t sz)
+add_programmer_store(struct device_driver *drv, const char *buf, size_t sz)
 {
 struct fpga_manager     *mgr;
 int                      stat;
@@ -744,12 +741,12 @@ file_store(struct device *dev, struct device_attribute *att, const char *buf, si
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 int    err;
 
-	if ( prg->file ) {
-		kfree( prg->file );
+	if ( prg->info.firmware_name ) {
+		kfree( prg->info.firmware_name );
 	}
 
-	prg->file = kstrdup( buf, GFP_KERNEL );
-	if ( ! prg->file ) {
+	prg->info.firmware_name = kstrdup( buf, GFP_KERNEL );
+	if ( ! prg->info.firmware_name ) {
 		return -ENOMEM;
 	} else {
 		if ( prg->autoload && (err = load_fw( prg ) ) ) {
@@ -767,11 +764,11 @@ file_show(struct device *dev, struct device_attribute *att, char *buf)
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 int                   len;
 
-	if ( ! prg->file ) {
+	if ( ! prg->info.firmware_name ) {
 		buf[0] = 0;
 		len    = 0;
 	} else {
-		len = snprintf(buf, PAGE_SIZE, "%s", prg->file);
+		len = snprintf(buf, PAGE_SIZE, "%s", prg->info.firmware_name);
 		if ( len >= PAGE_SIZE )
 			len = PAGE_SIZE - 1;
 	}
