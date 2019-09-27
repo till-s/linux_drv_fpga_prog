@@ -104,9 +104,16 @@
 #include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/fpga/fpga-mgr.h>
+#include <linux/version.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,16,1)
+#define FW_NAME firmware_name
+#else
+#define FW_NAME info.firmware_name
+#define HAS_NEW_API
+#endif
 
 /* Forward Declarations
  */
@@ -192,6 +199,9 @@ struct fpga_prog_drvdat {
 	 */
 	struct device_node     *mgrNode;
 	int                    autoload;
+#if !defined(HAS_NEW_API)
+	char                   *firmware_name;
+#endif
 	/* Info data for the manager
 	 */
 	struct fpga_image_info info;
@@ -326,7 +336,7 @@ load_fw(struct fpga_prog_drvdat *prg)
 struct fpga_manager   *mgr;
 int                    err;
 
-	if ( ! prg->info.firmware_name )
+	if ( ! prg->FW_NAME )
 		return -EINVAL;
 
 	mgr = of_fpga_mgr_get( prg->mgrNode );
@@ -334,7 +344,11 @@ int                    err;
 	if ( IS_ERR( mgr ) ) {
 		err = PTR_ERR( mgr );
 	} else {
+#if defined(HAS_NEW_API)
 		err = fpga_mgr_load( mgr, &prg->info );
+#else
+		err = fpga_mgr_firmware_load( mgr, &prg->info, prg->FW_NAME );
+#endif
 		fpga_mgr_put( mgr );
 	}
 
@@ -497,7 +511,7 @@ u32                      val;
 
 		stat = of_property_read_string( pnod, "file", &str );
 		if ( 0 == stat ) {
-			prog->info.firmware_name = kstrdup( str, GFP_KERNEL );
+			prog->FW_NAME = kstrdup( str, GFP_KERNEL );
 		} else if ( stat != -EINVAL ) {
 			printk(KERN_WARNING "%s: unable to read 'file' property from OF (%d)\n", drvnam, stat);
 		}
@@ -614,8 +628,12 @@ struct fpga_prog_drvdat *prg;
 		 * firmware.
 		 */
 		prg = platform_get_drvdata( pdev );
-		if ( prg->info.firmware_name && prg->autoload ) {
+		if ( prg->FW_NAME && prg->autoload ) {
+#if defined(HAS_NEW_API)
 			fwstat = fpga_mgr_load( mgr, &prg->info );
+#else
+			fwstat = fpga_mgr_firmware_load( mgr, &prg->info, prg->FW_NAME );
+#endif
 			if ( fwstat ) {
 				printk(KERN_WARNING "%s: programming firmware failed (%d)\n", drvnam, fwstat);
 			}
@@ -637,8 +655,9 @@ release_drvdat(struct fpga_prog_drvdat *prg)
 		of_node_put( prg->mgrNode );
 	}
 
-	if ( prg->info.firmware_name ) {
-		kfree( prg->info.firmware_name );
+	if ( prg->FW_NAME ) {
+		kfree( prg->FW_NAME );
+		prg->FW_NAME = 0;
 	}
 
 	kfree( prg );
@@ -741,12 +760,13 @@ file_store(struct device *dev, struct device_attribute *att, const char *buf, si
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 int    err;
 
-	if ( prg->info.firmware_name ) {
-		kfree( prg->info.firmware_name );
+	if ( prg->FW_NAME ) {
+		kfree( prg->FW_NAME );
+        prg->FW_NAME = 0;
 	}
 
-	prg->info.firmware_name = kstrdup( buf, GFP_KERNEL );
-	if ( ! prg->info.firmware_name ) {
+	prg->FW_NAME = kstrdup( buf, GFP_KERNEL );
+	if ( ! prg->FW_NAME ) {
 		return -ENOMEM;
 	} else {
 		if ( prg->autoload && (err = load_fw( prg ) ) ) {
@@ -764,11 +784,11 @@ file_show(struct device *dev, struct device_attribute *att, char *buf)
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 int                   len;
 
-	if ( ! prg->info.firmware_name ) {
+	if ( ! prg->FW_NAME ) {
 		buf[0] = 0;
 		len    = 0;
 	} else {
-		len = snprintf(buf, PAGE_SIZE, "%s", prg->info.firmware_name);
+		len = snprintf(buf, PAGE_SIZE, "%s", prg->FW_NAME);
 		if ( len >= PAGE_SIZE )
 			len = PAGE_SIZE - 1;
 	}
