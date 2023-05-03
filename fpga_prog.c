@@ -8,6 +8,8 @@
  * No part of the software, including this file, may be copied, modified,
  * propagated, or distributed except according to the terms contained in
  * the LICENSE.txt file.
+ *
+ * Till Straumann <till.straumann@alumni.tu-berlin.de>, 2016-2023
  */
 
 /*
@@ -301,11 +303,11 @@ struct fpga_manager *mgr  = ERR_PTR( -ENOENT );
  * is already using the fpga_manager with of-node 'data'
  */
 static int
-cmp_mgr_node(struct device *dev, void *data)
+cmp_mgr_node(struct device *dev, const void *data)
 {
 struct fpga_prog_drvdat *prg = get_drvdat( dev );
 
-	return (void *)prg->mgrNode == data;
+	return (const void *)prg->mgrNode == data;
 }
 
 /* Helper to locate a matching soft device which
