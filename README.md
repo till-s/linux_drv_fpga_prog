@@ -9,6 +9,8 @@
  propagated, or distributed except according to the terms contained in
  the LICENSE.txt file.
 
+ Till Straumann <till.straumann@alumni.tu-berlin.de>
+
 # What is fpga_prog
 
  A simple 'glue' driver to use the linux FPGA-manager without device-tree
